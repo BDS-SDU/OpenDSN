@@ -73,6 +73,15 @@ echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc && source ~/.bashrc
 
 See the [official Golang installation instructions](https://golang.org/doc/install) if you get stuck.
 
+#### FD limit
+
+```shell
+sudo echo "* soft nofile 256000" >> /etc/security/limits.conf
+sudo echo "* hard nofile 512000" >> /etc/security/limits.conf
+sudo sysctl -p
+## sudo reboot
+```
+
 ### MacOS
 
 #### Software dependencies

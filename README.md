@@ -197,7 +197,7 @@ export IPFS_GATEWAY=https://proof-parameters.s3.cn-south-1.jdcloud-oss.com/ipfs/
 
 5. 获取源码并构建
 ```bash
-git clone https://github.com/saika2k/OpenDSN.git 
+git clone https://github.com/BDS-SDU/OpenDSN.git 
 cd OpenDSN
 make debug
 ```

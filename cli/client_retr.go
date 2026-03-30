@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"sort"
 	"strings"
@@ -331,6 +332,337 @@ Examples:
 			return err
 		}
 		afmt.Println("Success")
+		return nil
+	},
+}
+
+var clientRetrieveVersionCmd = &cli.Command{
+	Name:      "retrieve-version",
+	Usage:     "Retrieve a root file and its patches, then reconstruct the requested version",
+	ArgsUsage: "[dataCid outputPath]",
+	Description: `Retrieve a versioned file from the Filecoin network.
+
+The command expects local metadata files created by 'lotus client deal --create' and
+'lotus client deal --update'. Starting from the requested dataCid, it walks backwards
+through <cid>_meta files until it reaches the root version, then retrieves each file
+in order: root, patch1, patch2, ..., patchN.
+
+Each retrieved file is exported to:
+  outputPath_tmp_0
+  outputPath_tmp_1
+  ...
+  outputPath_tmp_n
+
+After all files are exported, the command reconstructs the requested version by
+applying the patches in sequence with 'bspatch'.`,
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "from",
+			Usage: "address to send transactions from",
+		},
+		&cli.StringFlag{
+			Name:    "provider",
+			Usage:   "provider to use for retrieval, if not present it'll use local discovery",
+			Aliases: []string{"miner"},
+		},
+		&cli.StringFlag{
+			Name:  "maxPrice",
+			Usage: fmt.Sprintf("maximum price the client is willing to consider (default: %s FIL)", DefaultMaxRetrievePrice),
+		},
+		&cli.BoolFlag{
+			Name: "allow-local",
+			// todo: default to true?
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		if cctx.NArg() != 2 {
+			return IncorrectNumArgs(cctx)
+		}
+
+		targetCidStr := cctx.Args().Get(0)
+		outputPath := cctx.Args().Get(1)
+
+		if _, err := cid.Parse(targetCidStr); err != nil {
+			return xerrors.Errorf("parsing target dataCid: %w", err)
+		}
+
+		if _, err := os.Stat(outputPath); err == nil {
+			return xerrors.Errorf("output path already exists: %s", outputPath)
+		} else if !os.IsNotExist(err) {
+			return xerrors.Errorf("checking output path %s: %w", outputPath, err)
+		}
+
+		fapi, closer, err := GetFullNodeAPIV1(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+
+		ctx := ReqContext(cctx)
+		afmt := NewAppFmt(cctx.App)
+
+		var payer address.Address
+		if cctx.String("from") != "" {
+			payer, err = address.NewFromString(cctx.String("from"))
+		} else {
+			payer, err = fapi.WalletDefaultAddress(ctx)
+		}
+		if err != nil {
+			return err
+		}
+
+		maxPrice := types.MustParseFIL(DefaultMaxRetrievePrice)
+		if cctx.String("maxPrice") != "" {
+			maxPrice, err = types.ParseFIL(cctx.String("maxPrice"))
+			if err != nil {
+				return xerrors.Errorf("parsing maxPrice: %w", err)
+			}
+		}
+
+		versionChain := make([]string, 0)
+		visited := make(map[string]struct{})
+		currentCidStr := targetCidStr
+
+		for {
+			if _, seen := visited[currentCidStr]; seen {
+				return xerrors.Errorf("detected cycle in version metadata at cid %s", currentCidStr)
+			}
+			visited[currentCidStr] = struct{}{}
+
+			metaPath := fmt.Sprintf("%s_meta", currentCidStr)
+			content, err := os.ReadFile(metaPath)
+			if err != nil {
+				return xerrors.Errorf("reading metadata file %s: %w", metaPath, err)
+			}
+
+			normalized := strings.ReplaceAll(string(content), "\r\n", "\n")
+			normalized = strings.TrimRight(normalized, "\n")
+			lines := strings.Split(normalized, "\n")
+			if len(lines) < 2 {
+				return xerrors.Errorf("metadata file %s is invalid: expected at least 2 lines", metaPath)
+			}
+
+			previousCidStr := strings.TrimSpace(lines[0])
+			if previousCidStr == "" {
+				return xerrors.Errorf("metadata file %s is invalid: first line is empty", metaPath)
+			}
+
+			versionChain = append([]string{currentCidStr}, versionChain...)
+
+			if previousCidStr == "NULL" {
+				break
+			}
+
+			if _, err := cid.Parse(previousCidStr); err != nil {
+				return xerrors.Errorf("metadata file %s has invalid previous cid %q: %w", metaPath, previousCidStr, err)
+			}
+
+			currentCidStr = previousCidStr
+		}
+
+		if len(versionChain) == 0 {
+			return xerrors.Errorf("failed to resolve version chain for %s", targetCidStr)
+		}
+
+		afmt.Printf("Resolved version chain: %s\n", strings.Join(versionChain, " -> "))
+
+		if len(versionChain) > 1 {
+			if _, err := exec.LookPath("bspatch"); err != nil {
+				return xerrors.Errorf("bspatch not found in PATH: %w", err)
+			}
+		}
+
+		localImports := make(map[string]string)
+		if cctx.Bool("allow-local") {
+			imports, err := fapi.ClientListImports(ctx)
+			if err != nil {
+				return err
+			}
+			for _, i := range imports {
+				if i.Root != nil {
+					localImports[i.Root.String()] = i.CARPath
+				}
+			}
+		}
+
+		for i, chainCidStr := range versionChain {
+			file, err := cid.Parse(chainCidStr)
+			if err != nil {
+				return xerrors.Errorf("parsing cid %s in version chain: %w", chainCidStr, err)
+			}
+
+			tmpPath := fmt.Sprintf("%s_tmp_%d", outputPath, i)
+			if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+				return xerrors.Errorf("removing stale temp file %s: %w", tmpPath, err)
+			}
+
+			var eref *lapi.ExportRef
+			if carPath, ok := localImports[file.String()]; ok {
+				eref = &lapi.ExportRef{
+					Root:         file,
+					FromLocalCAR: carPath,
+				}
+				afmt.Printf("Using local import for %s\n", chainCidStr)
+			} else {
+				var offer lapi.QueryOffer
+				minerStrAddr := cctx.String("provider")
+
+				if minerStrAddr == "" {
+					offers, err := fapi.ClientFindData(ctx, file, nil)
+					if err != nil {
+						return err
+					}
+
+					var cleaned []lapi.QueryOffer
+					for _, o := range offers {
+						if o.Err == "" {
+							cleaned = append(cleaned, o)
+						}
+					}
+					offers = cleaned
+
+					sort.Slice(offers, func(i, j int) bool {
+						return offers[i].MinPrice.LessThan(offers[j].MinPrice)
+					})
+
+					if len(offers) < 1 {
+						return xerrors.Errorf("failed to find providers for %s", chainCidStr)
+					}
+
+					offer = offers[0]
+				} else {
+					minerAddr, err := address.NewFromString(minerStrAddr)
+					if err != nil {
+						return err
+					}
+
+					offer, err = fapi.ClientMinerQueryOffer(ctx, minerAddr, file, nil)
+					if err != nil {
+						return err
+					}
+				}
+
+				if offer.Err != "" {
+					return xerrors.Errorf("offer error for %s: %s", chainCidStr, offer.Err)
+				}
+
+				if offer.MinPrice.GreaterThan(big.Int(maxPrice)) {
+					return xerrors.Errorf("failed to find offer for %s satisfying maxPrice: %s", chainCidStr, maxPrice)
+				}
+
+				order := offer.Order(payer)
+				retrievalCtx, cancel := context.WithCancel(ctx)
+
+				subscribeEvents, err := fapi.ClientGetRetrievalUpdates(retrievalCtx)
+				if err != nil {
+					cancel()
+					return xerrors.Errorf("error setting up retrieval updates for %s: %w", chainCidStr, err)
+				}
+
+				retrievalRes, err := fapi.ClientRetrieve(ctx, order)
+				if err != nil {
+					cancel()
+					return xerrors.Errorf("error setting up retrieval for %s: %w", chainCidStr, err)
+				}
+
+				start := time.Now()
+			readEvents:
+				for {
+					var evt lapi.RetrievalInfo
+					select {
+					case <-ctx.Done():
+						cancel()
+						return xerrors.New("Retrieval Timed Out")
+					case evt = <-subscribeEvents:
+						if evt.ID != retrievalRes.DealID {
+							continue
+						}
+					}
+
+					event := "New"
+					if evt.Event != nil {
+						event = retrievalmarket.ClientEvents[*evt.Event]
+					}
+
+					afmt.Printf("CID %s: Recv %s, Paid %s, %s (%s), %s\n",
+						chainCidStr,
+						types.SizeStr(types.NewInt(evt.BytesReceived)),
+						types.FIL(evt.TotalPaid),
+						strings.TrimPrefix(event, "ClientEvent"),
+						strings.TrimPrefix(retrievalmarket.DealStatuses[evt.Status], "DealStatus"),
+						time.Now().Sub(start).Truncate(time.Millisecond),
+					)
+
+					switch evt.Status {
+					case retrievalmarket.DealStatusCompleted:
+						break readEvents
+					case retrievalmarket.DealStatusRejected:
+						cancel()
+						return xerrors.Errorf("retrieval proposal rejected for %s: %s", chainCidStr, evt.Message)
+					case retrievalmarket.DealStatusCancelled:
+						cancel()
+						return xerrors.Errorf("retrieval proposal cancelled for %s: %s", chainCidStr, evt.Message)
+					case
+						retrievalmarket.DealStatusDealNotFound,
+						retrievalmarket.DealStatusErrored:
+						cancel()
+						return xerrors.Errorf("retrieval error for %s: %s", chainCidStr, evt.Message)
+					}
+				}
+
+				cancel()
+
+				eref = &lapi.ExportRef{
+					Root:   file,
+					DealID: retrievalRes.DealID,
+				}
+			}
+
+			err = fapi.ClientExport(ctx, *eref, lapi.FileRef{
+				Path:  tmpPath,
+				IsCAR: false,
+			})
+			if err != nil {
+				return xerrors.Errorf("exporting %s to %s: %w", chainCidStr, tmpPath, err)
+			}
+
+			afmt.Printf("Exported %s to %s\n", chainCidStr, tmpPath)
+		}
+
+		rootTmpPath := fmt.Sprintf("%s_tmp_0", outputPath)
+		if err := os.Rename(rootTmpPath, outputPath); err != nil {
+			return xerrors.Errorf("moving root file from %s to %s: %w", rootTmpPath, outputPath, err)
+		}
+
+		for i := 1; i < len(versionChain); i++ {
+			patchPath := fmt.Sprintf("%s_tmp_%d", outputPath, i)
+			nextWorkPath := fmt.Sprintf("%s_work_%d", outputPath, i)
+
+			if err := os.Remove(nextWorkPath); err != nil && !os.IsNotExist(err) {
+				return xerrors.Errorf("removing stale work file %s: %w", nextWorkPath, err)
+			}
+
+			cmd := exec.CommandContext(ctx, "bspatch", outputPath, nextWorkPath, patchPath)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				return xerrors.Errorf("applying patch %s: %w: %s", patchPath, err, strings.TrimSpace(string(output)))
+			}
+
+			if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
+				return xerrors.Errorf("removing previous reconstructed file %s: %w", outputPath, err)
+			}
+			if err := os.Rename(nextWorkPath, outputPath); err != nil {
+				return xerrors.Errorf("replacing %s with patched output %s: %w", outputPath, nextWorkPath, err)
+			}
+
+			if err := os.Remove(patchPath); err != nil && !os.IsNotExist(err) {
+				return xerrors.Errorf("cleaning patch temp file %s: %w", patchPath, err)
+			}
+
+			afmt.Printf("Applied patch %s\n", patchPath)
+		}
+
+		afmt.Printf("Reconstructed version %s at %s\n", targetCidStr, outputPath)
 		return nil
 	},
 }

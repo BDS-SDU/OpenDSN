@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/filecoin-project/lotus/lib/dyaic"
 	"io"
 	"math"
 	"math/rand"
@@ -19,6 +18,8 @@ import (
 	"sync/atomic"
 	"text/tabwriter"
 	"time"
+
+	"github.com/filecoin-project/lotus/lib/dyaic"
 
 	tm "github.com/buger/goterm"
 	"github.com/chzyer/readline"
@@ -87,6 +88,8 @@ var clientCmd = &cli.Command{
 		WithCategory("storage", clientDealStatsCmd),
 		WithCategory("storage", clientInspectDealCmd),
 		WithCategory("data", clientImportCmd),
+		WithCategory("data", clientListRootCmd),
+		WithCategory("data", clientListVersionCmd),
 		WithCategory("data", clientDropCmd),
 		WithCategory("data", clientLocalCmd),
 		WithCategory("data", clientStat),
@@ -100,6 +103,7 @@ var clientCmd = &cli.Command{
 		WithCategory("retrieval", clientFindCmd),
 		WithCategory("retrieval", clientQueryRetrievalAskCmd),
 		WithCategory("retrieval", clientRetrieveCmd),
+		WithCategory("retrieval", clientRetrieveVersionCmd),
 		WithCategory("retrieval", clientRetrieveCatCmd),
 		WithCategory("retrieval", clientRetrieveLsCmd),
 		WithCategory("retrieval", clientCancelRetrievalDealCmd),
@@ -165,6 +169,141 @@ var clientImportCmd = &cli.Command{
 		}
 		fmt.Println(encoder.Encode(c.Root))
 
+		return nil
+	},
+}
+
+var clientListRootCmd = &cli.Command{
+	Name:  "list-root",
+	Usage: "List root cids of files stored in the DSN",
+	Action: func(cctx *cli.Context) error {
+		if cctx.NArg() != 0 {
+			return IncorrectNumArgs(cctx)
+		}
+
+		afmt := NewAppFmt(cctx.App)
+
+		content, err := os.ReadFile("fileroots.log")
+		if err != nil {
+			if os.IsNotExist(err) {
+				afmt.Println("DSN Roots")
+				afmt.Println("---------")
+				afmt.Println("")
+				afmt.Println("No root files are currently recorded in the DSN.")
+				afmt.Println("Tip: You can upload a new file with 'lotus client import' and 'lotus client deal --create'.")
+				return nil
+			}
+			return xerrors.Errorf("reading fileroots.log: %w", err)
+		}
+
+		normalized := strings.ReplaceAll(string(content), "\r\n", "\n")
+		normalized = strings.TrimSpace(normalized)
+
+		afmt.Println("DSN Roots")
+		afmt.Println("---------")
+
+		if normalized == "" {
+			afmt.Println("(empty)")
+			afmt.Println("")
+			afmt.Println("Tip: Use 'lotus client list-version <root>' to inspect the head information of a file version chain.")
+			return nil
+		}
+
+		rootIndex := 0
+		for _, line := range strings.Split(normalized, "\n") {
+			rootCid := strings.TrimSpace(line)
+			if rootCid == "" {
+				continue
+			}
+			afmt.Printf("ROOT %d: %s\n", rootIndex, rootCid)
+			rootIndex++
+		}
+
+		afmt.Println("")
+		afmt.Println("Tip: Use 'lotus client list-version <root>' to inspect the head information of a file version chain.")
+		return nil
+	},
+}
+
+var clientListVersionCmd = &cli.Command{
+	Name:      "list-version",
+	Usage:     "List the version chain of a file starting from its root cid",
+	ArgsUsage: "[root]",
+	Action: func(cctx *cli.Context) error {
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
+		}
+
+		afmt := NewAppFmt(cctx.App)
+		rootCid := strings.TrimSpace(cctx.Args().Get(0))
+		if rootCid == "" {
+			return xerrors.Errorf("root cid cannot be empty")
+		}
+
+		if _, err := cid.Parse(rootCid); err != nil {
+			return xerrors.Errorf("parsing root cid: %w", err)
+		}
+
+		metaPath := fmt.Sprintf("%s_meta", rootCid)
+		if _, err := os.Stat(metaPath); err != nil {
+			if os.IsNotExist(err) {
+				afmt.Println("Version Chain")
+				afmt.Println("-------------")
+				afmt.Println("The file does not exist in the current directory metadata.")
+				afmt.Println("")
+				afmt.Println("Tip: Use 'lotus client list-root' to view files currently stored in the DSN.")
+				return nil
+			}
+			return xerrors.Errorf("checking %s: %w", metaPath, err)
+		}
+
+		visited := make(map[string]struct{})
+		currentCid := rootCid
+		versionIndex := 0
+
+		afmt.Println("Version Chain")
+		afmt.Println("-------------")
+		afmt.Printf("ROOT(v1): %s\n", rootCid)
+
+		for {
+			if _, seen := visited[currentCid]; seen {
+				return xerrors.Errorf("detected cycle in version metadata at cid %s", currentCid)
+			}
+			visited[currentCid] = struct{}{}
+
+			currentMetaPath := fmt.Sprintf("%s_meta", currentCid)
+			content, err := os.ReadFile(currentMetaPath)
+			if err != nil {
+				return xerrors.Errorf("reading %s: %w", currentMetaPath, err)
+			}
+
+			normalized := strings.ReplaceAll(string(content), "\r\n", "\n")
+			normalized = strings.TrimRight(normalized, "\n")
+			lines := strings.Split(normalized, "\n")
+			if len(lines) < 2 {
+				return xerrors.Errorf("metadata file %s is invalid: expected at least 2 lines", currentMetaPath)
+			}
+
+			nextCid := strings.TrimSpace(lines[1])
+			if nextCid == "" {
+				return xerrors.Errorf("metadata file %s is invalid: second line is empty", currentMetaPath)
+			}
+
+			if nextCid == "NULL" {
+				break
+			}
+
+			if _, err := cid.Parse(nextCid); err != nil {
+				return xerrors.Errorf("metadata file %s has invalid head cid %q: %w", currentMetaPath, nextCid, err)
+			}
+
+			versionIndex++
+			afmt.Printf("HEAD(v%d): %s\n", versionIndex+1, nextCid)
+			currentCid = nextCid
+		}
+
+		afmt.Println("")
+		afmt.Println("Tip: Use 'lotus client retrieve-version <head> <outputPath>' to retrieve any version of this file.")
 		return nil
 	},
 }
@@ -362,6 +501,18 @@ The minimum value is 518400 (6 months).`,
 			Name:  "provider-collateral",
 			Usage: "specify the requested provider collateral the miner should put up",
 		},
+		&cli.BoolFlag{
+			Name:  "create",
+			Usage: "mark this deal as the initial version of a file",
+		},
+		&cli.BoolFlag{
+			Name:  "update",
+			Usage: "mark this deal as a patch/update of a previous file version",
+		},
+		&cli.StringFlag{
+			Name:  "previous",
+			Usage: "previous file version cid, required when --update is set",
+		},
 		&CidBaseFlag,
 	},
 	Action: func(cctx *cli.Context) error {
@@ -371,6 +522,9 @@ The minimum value is 518400 (6 months).`,
 		if !cctx.Args().Present() {
 			if cctx.Bool("manual-stateless-deal") {
 				return xerrors.New("--manual-stateless-deal can not be combined with interactive deal mode: you must specify the " + expectedArgsMsg)
+			}
+			if cctx.Bool("create") || cctx.Bool("update") || cctx.String("previous") != "" {
+				return xerrors.New("--create, --update, and --previous can not be combined with interactive deal mode: you must specify the " + expectedArgsMsg)
 			}
 			return interactiveDeal(cctx)
 		}
@@ -387,9 +541,25 @@ The minimum value is 518400 (6 months).`,
 			return IncorrectNumArgs(cctx)
 		}
 
+		createFlag := cctx.Bool("create")
+		updateFlag := cctx.Bool("update")
+		previousCid := cctx.String("previous")
+
+		if createFlag && updateFlag {
+			return xerrors.New("--create and --update cannot be used together")
+		}
+		if createFlag && previousCid != "" {
+			return xerrors.New("--previous cannot be used when --create is set")
+		}
+		if updateFlag && previousCid == "" {
+			return xerrors.New("--previous must be provided when --update is set")
+		}
+
 		// [data, miner, price, dur]
 
-		data, err := cid.Parse(cctx.Args().Get(0))
+		dataCidArg := cctx.Args().Get(0)
+
+		data, err := cid.Parse(dataCidArg)
 		if err != nil {
 			return err
 		}
@@ -508,6 +678,50 @@ The minimum value is 518400 (6 months).`,
 
 		if err != nil {
 			return err
+		}
+
+		if createFlag {
+			logFile, err := os.OpenFile("fileroots.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				return xerrors.Errorf("opening fileroots.log: %w", err)
+			}
+			if _, err := logFile.WriteString(dataCidArg + "\n"); err != nil {
+				_ = logFile.Close()
+				return xerrors.Errorf("writing fileroots.log: %w", err)
+			}
+			if err := logFile.Close(); err != nil {
+				return xerrors.Errorf("closing fileroots.log: %w", err)
+			}
+
+			metaPath := fmt.Sprintf("%s_meta", dataCidArg)
+			if err := os.WriteFile(metaPath, []byte("NULL\nNULL\n"), 0644); err != nil {
+				return xerrors.Errorf("writing %s: %w", metaPath, err)
+			}
+		}
+
+		if updateFlag {
+			previousMetaPath := fmt.Sprintf("%s_meta", previousCid)
+			content, err := os.ReadFile(previousMetaPath)
+			if err != nil {
+				return xerrors.Errorf("reading %s: %w", previousMetaPath, err)
+			}
+
+			normalized := strings.ReplaceAll(string(content), "\r\n", "\n")
+			normalized = strings.TrimRight(normalized, "\n")
+			lines := strings.Split(normalized, "\n")
+			if len(lines) < 2 {
+				return xerrors.Errorf("metadata file %s is invalid: expected at least 2 lines", previousMetaPath)
+			}
+
+			lines[1] = dataCidArg
+			if err := os.WriteFile(previousMetaPath, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+				return xerrors.Errorf("writing %s: %w", previousMetaPath, err)
+			}
+
+			currentMetaPath := fmt.Sprintf("%s_meta", dataCidArg)
+			if err := os.WriteFile(currentMetaPath, []byte(previousCid+"\nNULL\n"), 0644); err != nil {
+				return xerrors.Errorf("writing %s: %w", currentMetaPath, err)
+			}
 		}
 
 		encoder, err := GetCidEncoder(cctx)

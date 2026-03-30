@@ -27,6 +27,7 @@ import (
 	"github.com/filecoin-project/lotus/chain/actors/policy"
 	"github.com/filecoin-project/lotus/chain/messagepool"
 	"github.com/filecoin-project/lotus/chain/types"
+	"github.com/filecoin-project/lotus/storage/prooflog"
 	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
@@ -391,7 +392,12 @@ func (s *WindowPoStScheduler) runPoStCycle(ctx context.Context, manual bool, di 
 				"height", ts.Height(),
 				"skipped", skipCount)
 
-			tsStart := build.Clock.Now()
+			proofStartedAt, err := prooflog.StartProof(prooflog.WindowPoSt)
+			if err != nil {
+				log.Warnw("failed to update proof info log for window post start", "error", err)
+			}
+
+			tsStart := time.Now()
 
 			mid, err := address.IDFromAddress(s.actor)
 			if err != nil {
@@ -437,6 +443,7 @@ func (s *WindowPoStScheduler) runPoStCycle(ctx context.Context, manual bool, di 
 						SealedCID:    xsi.SealedCID,
 					}
 				}
+				verifyStartedAt := time.Now()
 				if correct, err := s.verifier.VerifyWindowPoSt(ctx, proof.WindowPoStVerifyInfo{
 					Randomness:        abi.PoStRandomness(checkRand),
 					Proofs:            postOut,
@@ -455,6 +462,11 @@ func (s *WindowPoStScheduler) runPoStCycle(ctx context.Context, manual bool, di 
 				somethingToProve = true
 				params.Partitions = partitions
 				params.Proofs = postOut
+				if !proofStartedAt.IsZero() {
+					if err := prooflog.CompleteProof(prooflog.WindowPoSt, proofStartedAt, verifyStartedAt); err != nil {
+						log.Warnw("failed to update proof info log for window post completion", "error", err)
+					}
+				}
 				break
 			}
 

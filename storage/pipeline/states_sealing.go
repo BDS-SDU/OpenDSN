@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/ipfs/go-cid"
 	"golang.org/x/xerrors"
@@ -27,6 +28,7 @@ import (
 	"github.com/filecoin-project/lotus/chain/actors/policy"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/storage/pipeline/lib/nullreader"
+	"github.com/filecoin-project/lotus/storage/prooflog"
 	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
@@ -566,6 +568,11 @@ func (m *Sealing) handleCommitting(ctx statemachine.Context, sector SectorInfo) 
 
 	log.Info("scheduling seal proof computation...")
 
+	proofStartedAt, err := prooflog.StartProof(prooflog.StorageProof)
+	if err != nil {
+		log.Warnw("failed to update proof info log for storage proof start", "error", err)
+	}
+
 	log.Infof("KOMIT %d %x(%d); %x(%d); %v; r:%s; d:%s", sector.SectorNumber, sector.TicketValue, sector.TicketEpoch, sector.SeedValue, sector.SeedEpoch, sector.pieceInfos(), sector.CommR, sector.CommD)
 
 	if sector.CommD == nil || sector.CommR == nil {
@@ -674,8 +681,15 @@ func (m *Sealing) handleCommitting(ctx statemachine.Context, sector SectorInfo) 
 			return nil
 		}
 
+		verifyStartedAt := time.Now()
 		if err := m.checkCommit(ctx.Context(), sector, porepProof, ts.Key()); err != nil {
 			return ctx.Send(SectorCommitFailed{xerrors.Errorf("commit check error: %w", err)})
+		}
+
+		if !proofStartedAt.IsZero() {
+			if err := prooflog.CompleteProof(prooflog.StorageProof, proofStartedAt, verifyStartedAt); err != nil {
+				log.Warnw("failed to update proof info log for storage proof completion", "error", err)
+			}
 		}
 	}
 

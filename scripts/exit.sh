@@ -127,10 +127,10 @@ stop_group "listen_and_send.sh" \
 
 stop_listen_port 9999 "listen_and_send nc listener"
 
-stop_group "trustdsn-api" \
-	"go run ./cmd/trustdsn-api" \
-	"/tmp/go-build.*/exe/trustdsn-api" \
-	"trustdsn-api"
+stop_group "opendsn-api" \
+	"go run ./cmd/opendsn-api" \
+	"/tmp/go-build.*/exe/opendsn-api" \
+	"opendsn-api"
 
 stop_group "demo-web dev server" \
 	"bash -lc cd demo-web && npm run dev" \

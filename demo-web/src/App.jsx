@@ -101,7 +101,7 @@ export default function App() {
   async function fetchMiners() {
     try {
       setMinersLoading(true);
-      const data = await getJSON("/api/miners");
+      const data = await getJSON("/miners");
       setMiners(data.miners || []);
     } catch (err) {
       console.error(err);
@@ -113,7 +113,7 @@ export default function App() {
   async function fetchProofs() {
     try {
       setProofsLoading(true);
-      const data = await getJSON("/api/proofs");
+      const data = await getJSON("/proofs");
       setProofs(data.proofs || []);
     } catch (err) {
       console.error(err);
@@ -165,7 +165,7 @@ export default function App() {
     try {
       setImportLoading(true);
       setImportMessage("Importing...");
-      const data = await postJSON("/api/client/import", {
+      const data = await postJSON("/client/import", {
         path: importPath.trim(),
       });
 
@@ -204,7 +204,7 @@ export default function App() {
         body.previous_root = dealPreviousRoot.trim();
       }
 
-      const data = await postJSON("/api/client/deal", body);
+      const data = await postJSON("/client/deal", body);
 
       if (data.success) {
         setDealMessage("Deal finished.");
@@ -231,7 +231,7 @@ export default function App() {
     try {
       setRetrieveLoading(true);
       setRetrieveMessage("Retrieving...");
-      const data = await postJSON("/api/client/retrieve-version", {
+      const data = await postJSON("/client/retrieve-version", {
         root: retrieveRoot.trim(),
         output_name: retrieveOutputName.trim(),
       });
@@ -257,7 +257,7 @@ export default function App() {
       setRootsLoading(true);
       setFileInfoMessage("");
       setVersions([]);
-      const data = await getJSON("/api/client/roots");
+      const data = await getJSON("/client/roots");
       setRoots(data.roots || []);
       if (!data.roots || data.roots.length === 0) {
         setFileInfoMessage("No roots found.");
@@ -281,7 +281,7 @@ export default function App() {
       setFileInfoMessage("");
       setRoots([]);
       const data = await getJSON(
-        `/api/client/versions?root=${encodeURIComponent(versionRoot.trim())}`
+        `/client/versions?root=${encodeURIComponent(versionRoot.trim())}`
       );
       setVersions(data.versions || []);
       if (!data.versions || data.versions.length === 0) {

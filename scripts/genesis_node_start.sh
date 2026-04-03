@@ -1,5 +1,8 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 collect_pids() {
 	local pattern
 	local pid
@@ -173,8 +176,12 @@ nohup bash scripts/listen_and_send.sh > fund.log 2>&1 &
 
 sleep 3
 
-nohup go run ./cmd/opendsn-api > api.log 2>&1 &
-nohup bash -lc 'cd demo-web && npm run dev' > demo-web.log 2>&1 &
+nohup env OPENDSN_API_ADDR=127.0.0.1:8080 OPENDSN_REPO_ROOT="$REPO_ROOT" \
+	go run ./cmd/opendsn-api > api.log 2>&1 &
+
+# For production deployment, the frontend should be built with `npm run build`
+# and served by nginx from demo-web/dist instead of running `npm run dev`.
+#nohup bash -lc 'cd demo-web && npm run dev' > demo-web.log 2>&1 &
 
 #nohup bash scripts_FileDES/server_listen_aggregate.sh > aggregate.log 2>&1 &
 

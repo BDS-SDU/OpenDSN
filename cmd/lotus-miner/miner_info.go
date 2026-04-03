@@ -120,6 +120,11 @@ func detectHostIP() (string, error) {
 		return "", fmt.Errorf("list network interfaces: %w", err)
 	}
 
+	var publicIPs []string
+	var privateIPs []string
+	var cgnatIPs []string
+	var otherIPs []string
+
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 {
 			continue
@@ -157,14 +162,33 @@ func detectHostIP() (string, error) {
 				continue
 			}
 
-			return ip4.String(), nil
+			switch {
+			case isPublicIPv4(ip4):
+				publicIPs = append(publicIPs, ip4.String())
+			case isPrivateIPv4(ip4):
+				privateIPs = append(privateIPs, ip4.String())
+			case isCarrierGradeNATIPv4(ip4):
+				cgnatIPs = append(cgnatIPs, ip4.String())
+			default:
+				otherIPs = append(otherIPs, ip4.String())
+			}
 		}
+	}
+
+	if ip := pickPreferredIP(publicIPs, privateIPs, cgnatIPs, otherIPs); ip != "" {
+		return ip, nil
 	}
 
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return "", fmt.Errorf("list interface addresses: %w", err)
 	}
+
+	publicIPs = nil
+	privateIPs = nil
+	cgnatIPs = nil
+	otherIPs = nil
+
 	for _, addr := range addrs {
 		ipNet, ok := addr.(*net.IPNet)
 		if !ok {
@@ -178,10 +202,69 @@ func detectHostIP() (string, error) {
 		if ip4 == nil {
 			continue
 		}
-		return ip4.String(), nil
+
+		if !ip4.IsGlobalUnicast() {
+			continue
+		}
+
+		switch {
+		case isPublicIPv4(ip4):
+			publicIPs = append(publicIPs, ip4.String())
+		case isPrivateIPv4(ip4):
+			privateIPs = append(privateIPs, ip4.String())
+		case isCarrierGradeNATIPv4(ip4):
+			cgnatIPs = append(cgnatIPs, ip4.String())
+		default:
+			otherIPs = append(otherIPs, ip4.String())
+		}
+	}
+
+	if ip := pickPreferredIP(publicIPs, privateIPs, cgnatIPs, otherIPs); ip != "" {
+		return ip, nil
 	}
 
 	return "", fmt.Errorf("no non-loopback IPv4 address found")
+}
+
+func pickPreferredIP(candidateGroups ...[]string) string {
+	for _, group := range candidateGroups {
+		if len(group) > 0 {
+			return group[0]
+		}
+	}
+
+	return ""
+}
+
+func isPublicIPv4(ip net.IP) bool {
+	return ip.IsGlobalUnicast() && !isPrivateIPv4(ip) && !isCarrierGradeNATIPv4(ip)
+}
+
+func isPrivateIPv4(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+
+	switch {
+	case ip4[0] == 10:
+		return true
+	case ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31:
+		return true
+	case ip4[0] == 192 && ip4[1] == 168:
+		return true
+	default:
+		return false
+	}
+}
+
+func isCarrierGradeNATIPv4(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+
+	return ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
 }
 
 func computeCommittedSpace(

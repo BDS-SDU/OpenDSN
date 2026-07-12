@@ -131,6 +131,8 @@ rm -rf DB
 rm -rf SST
 rm -rf client_upload
 rm -rf client_download
+rm -rf "$REPO_ROOT/.opendsn_catalog"
+rm -rf "$REPO_ROOT/.opendsn_preview_cache"
 rm -rf acc
 rm -rf leaf
 rm -rf paths

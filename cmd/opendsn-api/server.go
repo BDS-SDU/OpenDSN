@@ -2,12 +2,14 @@ package main
 
 import (
 	"net/http"
+	"sync"
 	"time"
 )
 
 type Server struct {
 	cfg        Config
 	httpClient *http.Client
+	catalogMu  sync.Mutex
 }
 
 func NewServer(cfg Config) *Server {
@@ -30,6 +32,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/client/retrieve-version", s.handleClientRetrieveVersion)
 	mux.HandleFunc("/api/client/roots", s.handleClientRoots)
 	mux.HandleFunc("/api/client/versions", s.handleClientVersions)
+	mux.HandleFunc("/api/catalog", s.handleCatalog)
+	mux.HandleFunc("/api/browse", s.handleBrowse)
+	mux.HandleFunc("/api/preview", s.handlePreview)
+	mux.HandleFunc("/api/preview/raw", s.handlePreviewRaw)
 
 	return withCORS(mux)
 }

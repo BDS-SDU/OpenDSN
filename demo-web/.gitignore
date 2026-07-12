@@ -1,2 +1,4 @@
 node_modules
 dist
+testdata
+.opendsn_preview_cache

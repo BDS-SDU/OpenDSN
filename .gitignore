@@ -53,3 +53,7 @@ build/builtin-actors/v*
 build/builtin-actors/*.car
 
 dist/
+
+.opendsn_catalog/
+.opendsn_preview_cache/
+testdata

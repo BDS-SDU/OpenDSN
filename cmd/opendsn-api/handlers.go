@@ -70,24 +70,50 @@ func (s *Server) handleClientImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	output, err := s.runLotusCommand(r.Context(), "client", "import", "-q", req.Path)
+	absPath, err := filepath.Abs(req.Path)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid file path")
+		return
+	}
+
+	info, err := os.Stat(absPath)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "cannot access file")
+		return
+	}
+	if info.IsDir() {
+		writeError(w, http.StatusBadRequest, "path is a directory, not a file")
+		return
+	}
+
+	output, err := s.runLotusCommand(r.Context(), "client", "import", "-q", absPath)
 	root := strings.TrimSpace(output)
 
 	if err != nil {
 		writeJSON(w, http.StatusOK, ImportResponse{
-			Success: false,
-			Message: "import failed",
-			Root:    root,
-			Output:  output,
+			Success:       false,
+			Message:       "import failed",
+			Root:          root,
+			Output:        output,
+			Path:          absPath,
+			FileName:      filepath.Base(absPath),
+			FileExtension: strings.ToLower(filepath.Ext(absPath)),
+			SizeBytes:     info.Size(),
+			SizeMB:        formatSizeMB(info.Size()),
 		})
 		return
 	}
 
 	writeJSON(w, http.StatusOK, ImportResponse{
-		Success: true,
-		Message: "import finished",
-		Root:    root,
-		Output:  output,
+		Success:       true,
+		Message:       "import finished",
+		Root:          root,
+		Output:        output,
+		Path:          absPath,
+		FileName:      filepath.Base(absPath),
+		FileExtension: strings.ToLower(filepath.Ext(absPath)),
+		SizeBytes:     info.Size(),
+		SizeMB:        formatSizeMB(info.Size()),
 	})
 }
 
@@ -106,6 +132,8 @@ func (s *Server) handleClientDeal(w http.ResponseWriter, r *http.Request) {
 	req.Root = strings.TrimSpace(req.Root)
 	req.Miner = strings.TrimSpace(req.Miner)
 	req.PreviousRoot = strings.TrimSpace(req.PreviousRoot)
+	req.SourcePath = strings.TrimSpace(req.SourcePath)
+	req.DisplayName = strings.TrimSpace(req.DisplayName)
 
 	if req.Root == "" {
 		writeError(w, http.StatusBadRequest, "root is required")
@@ -125,6 +153,7 @@ func (s *Server) handleClientDeal(w http.ResponseWriter, r *http.Request) {
 
 	output, err := s.runLotusCommand(r.Context(), args...)
 	proposalCID := strings.TrimSpace(output)
+	uploadedAt := time.Now().Format(time.RFC3339)
 	if err != nil {
 		writeJSON(w, http.StatusOK, DealResponse{
 			Success:     false,
@@ -135,11 +164,40 @@ func (s *Server) handleClientDeal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sizeBytes := req.SizeBytes
+	if sizeBytes <= 0 && req.SourcePath != "" {
+		if info, statErr := os.Stat(req.SourcePath); statErr == nil && !info.IsDir() {
+			sizeBytes = info.Size()
+		}
+	}
+
+	var (
+		catalogFile    CatalogFile
+		catalogVersion CatalogVersion
+		catalogErr     error
+	)
+
+	if req.PreviousRoot == "" {
+		catalogFile, catalogVersion, catalogErr = s.recordInitialVersion(req.Root, req.SourcePath, req.DisplayName, sizeBytes, req.Miner, uploadedAt)
+	} else {
+		catalogFile, catalogVersion, catalogErr = s.recordPatchVersion(req.Root, req.PreviousRoot, req.SourcePath, req.DisplayName, sizeBytes, req.Miner, uploadedAt)
+	}
+
+	message := "deal finished"
+	if catalogErr != nil {
+		message = fmt.Sprintf("deal finished, but catalog update failed: %v", catalogErr)
+	}
+
 	writeJSON(w, http.StatusOK, DealResponse{
-		Success:     true,
-		Message:     "deal finished",
-		ProposalCID: proposalCID,
-		Output:      output,
+		Success:      true,
+		Message:      message,
+		ProposalCID:  proposalCID,
+		Output:       output,
+		InitialRoot:  catalogFile.RootCID,
+		VersionLabel: catalogVersion.VersionLabel,
+		FileName:     catalogVersion.SourceName,
+		FileSizeMB:   formatSizeMB(sizeBytes),
+		UploadedAt:   uploadedAt,
 	})
 }
 
@@ -156,9 +214,15 @@ func (s *Server) handleClientRetrieveVersion(w http.ResponseWriter, r *http.Requ
 	}
 
 	req.Root = strings.TrimSpace(req.Root)
+	req.CID = strings.TrimSpace(req.CID)
 	req.OutputName = strings.TrimSpace(req.OutputName)
-	if req.Root == "" {
-		writeError(w, http.StatusBadRequest, "root is required")
+
+	targetCID := req.CID
+	if targetCID == "" {
+		targetCID = req.Root
+	}
+	if targetCID == "" {
+		writeError(w, http.StatusBadRequest, "cid is required")
 		return
 	}
 	if req.OutputName == "" {
@@ -167,22 +231,31 @@ func (s *Server) handleClientRetrieveVersion(w http.ResponseWriter, r *http.Requ
 	}
 
 	outputPath := filepath.Join(s.cfg.RepoRoot, req.OutputName)
-	output, err := s.runLotusCommand(r.Context(), "client", "retrieve-version", req.Root, outputPath)
+	output, err := s.runLotusCommand(r.Context(), "client", "retrieve-version", targetCID, outputPath)
 	if err != nil {
 		writeJSON(w, http.StatusOK, RetrieveVersionResponse{
-			Success:    false,
-			Message:    "retrieve-version failed",
-			OutputPath: outputPath,
-			Output:     output,
+			Success:      false,
+			Message:      "retrieve-version failed",
+			OutputPath:   outputPath,
+			Output:       output,
+			RetrievedCID: targetCID,
 		})
 		return
 	}
 
+	var sizeBytes int64
+	if info, statErr := os.Stat(outputPath); statErr == nil && !info.IsDir() {
+		sizeBytes = info.Size()
+	}
+
 	writeJSON(w, http.StatusOK, RetrieveVersionResponse{
-		Success:    true,
-		Message:    "retrieve-version finished",
-		OutputPath: outputPath,
-		Output:     output,
+		Success:      true,
+		Message:      "retrieve-version finished",
+		OutputPath:   outputPath,
+		Output:       output,
+		RetrievedCID: targetCID,
+		SizeBytes:    sizeBytes,
+		SizeMB:       formatSizeMB(sizeBytes),
 	})
 }
 
